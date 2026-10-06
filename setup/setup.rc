@@ -1,0 +1,36 @@
+// 安装程序资源：图标 + 清单 + 版本信息
+// 注意：payload.rc（内嵌的安装文件清单）由 build/pack_setup.py 自动生成
+#include "resource.h"
+#include <winver.h>
+
+IDI_APPICON     ICON    "app.ico"
+IDR_LOGO_PNG    RCDATA  "logo_ui.png"   // 与主程序共用（build/make_icon.py 生成，见 app.rc 注释）
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     1,0,0,0
+ PRODUCTVERSION  1,0,0,0
+ FILEFLAGSMASK   0x3fL
+ FILEFLAGS       0x0L
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_APP
+ FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName",      "Dynamic Wallpapers"
+            VALUE "FileDescription",  "Dynamic Wallpapers 安装程序"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "DynamicWallpapersSetup"
+            VALUE "OriginalFilename", "DynamicWallpapersSetup.exe"
+            VALUE "ProductName",      "Dynamic Wallpapers"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "LegalCopyright",   "MIT License"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

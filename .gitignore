@@ -1,0 +1,14 @@
+# 构建产物（安装包/便携版发布到 GitHub Releases，不进仓库）
+dist/
+
+# 中间构建文件
+*.o
+*.obj
+*.res
+__pycache__/
+
+# 系统 / 编辑器
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
