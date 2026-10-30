@@ -57,6 +57,7 @@ static AccentRamp SystemAccentRamp() {
 }
 
 bool SystemUsesDarkMode() {
+    // Windows 的“自定义”可为系统和应用分别设置颜色；应用界面和壁纸均跟随应用模式。
     DWORD v = 1, sz = sizeof(v);
     if (RegGetValueW(HKEY_CURRENT_USER,
                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",

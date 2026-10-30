@@ -21,6 +21,8 @@ static bool ColorEq(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b) {
 
 bool Gfx::init(HWND hwnd) {
     hwnd_ = hwnd;
+    dpi_ = GetDpiForWindow(hwnd);
+    if (!dpi_) dpi_ = 96;
 
     // 失败统一走 bail：局部 DXGI 对象和已建好的成员一起放干净，不留半初始化状态
     IDXGIDevice* dxgiDevice = nullptr;
@@ -54,6 +56,7 @@ bool Gfx::init(HWND hwnd) {
     // 透明底上用灰度抗锯齿，避免 ClearType 出现彩边
     dc_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     dc_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    dc_->SetDpi((float)dpi_, (float)dpi_);
 
     if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                                    (IUnknown**)&dwrite_)))
@@ -135,22 +138,27 @@ void Gfx::resize(UINT physicalW, UINT physicalH, UINT dpi) {
 
     bool dpiChanged = (dpi != dpi_);
     w_ = physicalW; h_ = physicalH;
+    dpi_ = dpi;
+    bool growBuffer = w_ > bufW_ || h_ > bufH_;
 
     // 正常情况下这里只记下窗口大小：缓冲是整块显示器尺寸，窗口 = 缓冲的可见
     // 区域（左上角），逐帧改窗口大小不碰 DXGI。只有窗口长到超出缓冲（换显示器）
-    // 或 DPI 变了才真的重建一次。
-    if (dpiChanged || w_ > bufW_ || h_ > bufH_) {
+    // 才重建缓冲；DPI 只改变坐标映射，不需要重新分配 GPU 内存。
+    if (growBuffer || dpiChanged) {
+        if (target_) { dc_->SetTarget(nullptr); target_->Release(); target_ = nullptr; }
+    }
+    if (growBuffer) {
         UINT nw = (w_ > bufW_) ? w_ : bufW_;
         UINT nh = (h_ > bufH_) ? h_ : bufH_;
-        dpi_ = dpi;
-        if (target_) { dc_->SetTarget(nullptr); target_->Release(); target_ = nullptr; }
         if (SUCCEEDED(swap_->ResizeBuffers(0, nw, nh, DXGI_FORMAT_UNKNOWN, 0))) {
             bufW_ = nw; bufH_ = nh;
         }
         // ResizeBuffers 失败（设备被移除等）也要把目标位图建回来：旧缓冲还在，画面
         // 暂时不跟窗口大小走，好过 target_ 空着、begin() 从此失败、黑屏到重启
+    }
+    if (growBuffer || dpiChanged) {
+        // 目标位图的 DPI 在创建时指定；只重建视图，复用交换链的像素缓冲。
         createTargetFromSwapChain();
-        // 之后所有绘制坐标都是 DIP
         dc_->SetDpi((float)dpi_, (float)dpi_);
     }
 }

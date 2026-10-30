@@ -42,7 +42,7 @@ static const wchar_t* kAppDisplay = L"Dynamic Wallpapers";      // 显示名（�
 static const wchar_t* kAppExe     = L"DynamicWallpapers.exe";   // 主程序文件名
 static const wchar_t* kLegacyDisplay = L"壁纸随时间变化";        // 更名前：显示名/快捷方式名
 static const wchar_t* kLegacyAppName  = L"TimeWall";            // 更名前：安装目录/卸载项/自启项名
-static const wchar_t* kVersion = L"1.0.0";
+static const wchar_t* kVersion = L"2.0.0";
 
 #define RES_MANIFEST 2000
 #define WM_APP_QUIT   (WM_APP + 3)
@@ -140,6 +140,21 @@ static std::wstring DefaultInstallDir() {
     wchar_t buf[MAX_PATH * 2] = {0};
     SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf);
     return JoinPath(JoinPath(buf, L"Programs"), kAppDisplay);
+}
+
+// 已注册的现版本或旧版本视为升级；也兼容卸载项丢失但目标目录已有程序的情况。
+static bool HasExistingInstall() {
+    for (const wchar_t* key : {
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DynamicWallpapers",
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\TimeWall" }) {
+        HKEY opened = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, key, 0, KEY_READ, &opened) == ERROR_SUCCESS) {
+            RegCloseKey(opened);
+            return true;
+        }
+    }
+    DWORD attributes = GetFileAttributesW(JoinPath(g_s.installDir, kAppExe).c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 // 读取内嵌清单，并按主题聚合出复选框列表
@@ -690,6 +705,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                             MB_OK | MB_ICONERROR);
                 break;
             }
+            if (!HasExistingInstall() &&
+                MessageBoxW(h,
+                    L"Dynamic Wallpapers 与 Wallpaper Engine 同时运行时可能相互覆盖壁纸，导致壁纸切换异常。\n\n"
+                    L"建议使用本软件时退出或暂停 Wallpaper Engine。\n\n是否继续安装？",
+                    L"壁纸软件冲突提醒", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+                break;
             RunInstall();
             break;
         case CID_RUN: {

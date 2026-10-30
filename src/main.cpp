@@ -35,6 +35,7 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned i
 #include "ui.h"
 #include "core.h"
 #include "resource.h"
+#include "thumbs.h"
 
 #pragma comment(lib, "shell32")
 
@@ -153,6 +154,10 @@ struct App {
     Config cfg;
     std::vector<ThemeInfo> themes;
     int selIdx = 0;
+    std::wstring appliedImage;               // 仅在应用成功后更新，失败留给定时器重试
+    int appliedStyle = -1;
+    bool applyingWallpaper = false;          // 防止壁纸广播设置变更时重入
+    std::vector<std::pair<std::wstring, std::wstring>> wallpaperSnapshot;
     Palette pal;
     bool glass = true;                      // 自绘磨砂底（--self-glass 强制时用）
     bool liveGlass = false;                 // 系统亚克力（DWM 实时模糊窗口背后，Win11 22H2+）
@@ -226,6 +231,33 @@ struct App {
     ULONGLONG statusMsgUntil = 0;
 };
 static App g_app;
+static ThumbLoader g_thumbLoader;
+static size_t g_thumbGeneration = 0;
+static const UINT kThumbReadyMessage = WM_APP + 5;
+
+// 只在动画期间提高计时精度，嵌套动画共享一次系统请求。
+static unsigned g_timerPrecisionUsers = 0;
+class AnimationTimerPrecision {
+public:
+    AnimationTimerPrecision() = default;
+    AnimationTimerPrecision(const AnimationTimerPrecision&) = delete;
+    AnimationTimerPrecision& operator=(const AnimationTimerPrecision&) = delete;
+    ~AnimationTimerPrecision() { release(); }
+    void acquire() {
+        if (active_) return;
+        if (!g_timerPrecisionUsers && timeBeginPeriod(1) != 0) return;
+        ++g_timerPrecisionUsers;
+        active_ = true;
+    }
+    void release() {
+        if (!active_) return;
+        active_ = false;
+        if (--g_timerPrecisionUsers == 0) timeEndPeriod(1);
+    }
+private:
+    bool active_ = false;
+};
+static AnimationTimerPrecision g_animTimerPrecision;
 
 // 前向声明（本文件内互相调用）
 static void ComputeLayout(Layout& L);
@@ -238,6 +270,7 @@ static void RunZoomAnim();
 static void StartWindowAnim(bool show);
 static void TrackNormRect();
 static void ShowMainWindow();
+static bool EnsureUiInitialized();
 static void HideMainWindow();
 static void SelectTheme(int idx);
 static void OpenThemesFolder();
@@ -579,9 +612,36 @@ static int HitTest(float x, float y) {
 //  壁纸应用
 // ---------------------------------------------------------------------------
 static const ThemeInfo* SelectedTheme() {
+    if (g_app.cfg.noTheme) return nullptr;
     if (g_app.themes.empty()) return nullptr;
     if (g_app.selIdx < 0 || g_app.selIdx >= (int)g_app.themes.size()) g_app.selIdx = 0;
     return &g_app.themes[g_app.selIdx];
+}
+
+// 只比较两次快照中都存在的显示器，插拔显示器不会被当成手动换壁纸。
+static void CheckExternalWallpaper() {
+    if (g_app.applyingWallpaper || g_app.cfg.noTheme || !SelectedTheme()) return;
+    std::vector<std::pair<std::wstring, std::wstring>> current;
+    if (!ReadWallpaperSnapshot(current)) return;
+    bool changed = false;
+    for (const auto& now : current) {
+        for (const auto& before : g_app.wallpaperSnapshot) {
+            if (_wcsicmp(now.first.c_str(), before.first.c_str()) == 0 &&
+                _wcsicmp(now.second.c_str(), before.second.c_str()) != 0) changed = true;
+        }
+    }
+    g_app.wallpaperSnapshot = std::move(current);
+    if (!changed) return;
+    g_app.cfg.noTheme = true;
+    g_app.cfg.theme.clear();
+    g_app.selIdx = -1;
+    g_app.appliedImage.clear();
+    g_app.appliedStyle = -1;
+    g_app.statusMsg = L"检测到壁纸更换，已退出主题";
+    g_app.statusMsgUntil = GetTickCount64() + 6000;
+    SaveConfig(g_app.cfg);
+    if (g_app.glass) EnsureGlassBitmap(true);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
 // 当前该显示哪张壁纸：0=浅色（主题里的日间图）1=深色（夜间图）。
@@ -592,15 +652,31 @@ static int TargetStage() {
 }
 
 static void ApplyCurrent(bool force) {
+    if (g_app.applyingWallpaper) return;
     const ThemeInfo* t = SelectedTheme();
     if (!t) return;
     int stage = TargetStage();
-    const std::wstring& img = (stage == 0) ? t->dayImage : t->nightImage;
+    const std::wstring img = (stage == 0) ? t->dayImage : t->nightImage;
+    const int style = g_app.cfg.wallpaperStyle;
     if (!force && !g_app.cfg.autoSwitch) return;
-    if (ApplyWallpaper(img, g_app.cfg.wallpaperStyle)) {
+    if (!force && img == g_app.appliedImage &&
+        style == g_app.appliedStyle) return;
+    if (g_app.wallpaperSnapshot.empty()) ReadWallpaperSnapshot(g_app.wallpaperSnapshot);
+    g_app.applyingWallpaper = true;
+    bool ok = ApplyWallpaper(img, style);
+    g_app.applyingWallpaper = false;
+    if (ok) {
+        std::vector<std::pair<std::wstring, std::wstring>> snapshot;
+        if (ReadWallpaperSnapshot(snapshot)) g_app.wallpaperSnapshot = std::move(snapshot);
+        else g_app.wallpaperSnapshot.clear();
+        g_app.appliedImage = img;
+        g_app.appliedStyle = style;
         g_app.statusMsg = std::wstring(L"已应用") + (stage == 0 ? L"浅色" : L"深色") + L"壁纸";
         g_app.statusMsgUntil = GetTickCount64() + 4000;
         if (g_app.glass) EnsureGlassBitmap(true);    // 换壁纸后立刻重采磨砂底
+    } else {
+        g_app.appliedImage.clear();
+        g_app.appliedStyle = -1;
     }
     InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
@@ -673,7 +749,7 @@ static void DrawThemes(Gfx& g, const Palette& p) {
         g_app.delVisible[ti] = showDel ? 1 : 0;   // 命中测试用：只认"画出来了"的按钮
         ID2D1Bitmap* thumb = (ti < (int)g_app.thumbs.size()) ? g_app.thumbs[ti] : nullptr;
         UiThemeCard(g, L.themeCards[ti], thumb, g_app.themes[ti].name, sub,
-                    ti == g_app.selIdx, g_app.hot == CID_THEME0 + ti, p,
+                    !g_app.cfg.noTheme && ti == g_app.selIdx, g_app.hot == CID_THEME0 + ti, p,
                     showDel, delHot, renHot);
     }
 }
@@ -791,7 +867,7 @@ static void DrawStatus(Gfx& g, const Palette& p) {
     std::wstring cur = (stage == 0) ? L"浅色" : L"深色";
     std::wstring src = (g_app.cfg.switchMode == 1) ? L"跟随系统"
                                                    : (stage == 0 ? L"日间时段" : L"夜间时段");
-    run(std::wstring(L"当前：") + cur + L"（" + src + L"）", fBold, p.textPrimary);
+    run(t ? std::wstring(L"当前：") + cur + L"（" + src + L"）" : L"当前：无主题", fBold, p.textPrimary);
     if (g_app.simulateHour >= 0) run(L"模拟", fSmall, p.accentText);
     if (!g_app.statusMsg.empty() && GetTickCount64() < g_app.statusMsgUntil) {
         run(g_app.statusMsg, fSmall, p.accentText);
@@ -803,13 +879,18 @@ static void DrawStatus(Gfx& g, const Palette& p) {
 
     // 右侧：下次切换倒计时 / 跟随系统时的来源说明 / 已暂停
     IDWriteTextFormat* fRight = g.format(FONT_UI, 12.0f);
-    if (!g_app.cfg.autoSwitch) {
+    if (!t) {
+        g.textOptical(L"选择主题以启用壁纸切换", fRight,
+                      D2D1::RectF((L.contentL + L.contentR) / 2, L.statusRow.top,
+                                  L.statusRow.right, L.statusRow.bottom),
+                      p.textSecondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    } else if (!g_app.cfg.autoSwitch) {
         g.textOptical(L"自动切换已暂停（托盘菜单里可打开）", fRight,
                       D2D1::RectF((L.contentL + L.contentR) / 2, L.statusRow.top,
                                   L.statusRow.right, L.statusRow.bottom),
                       p.textSecondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
     } else if (g_app.cfg.switchMode == 1) {
-        std::wstring right = std::wstring(L"跟随系统深浅色（系统当前：") +
+        std::wstring right = std::wstring(L"跟随 Windows 应用模式（当前：") +
                              (SystemUsesDarkMode() ? L"深色" : L"浅色") + L"）";
         g.textOptical(right, fRight,
                       D2D1::RectF((L.contentL + L.contentR) / 2, L.statusRow.top,
@@ -1179,6 +1260,7 @@ static void ConfirmAddTheme() {
     for (size_t i = 0; i < g_app.themes.size(); ++i)
         if (g_app.themes[i].name == outName) g_app.selIdx = (int)i;
     g_app.cfg.theme = outName;
+    g_app.cfg.noTheme = false;
     SaveConfig(g_app.cfg);
     ClearThumbs();
     ComputeLayout(g_app.L);
@@ -1238,7 +1320,7 @@ static void ConfirmRenameTheme() {
     bool wasSelected = (g_app.cfg.theme == oldName);
     g_app.themes = ScanThemes();
     if (wasSelected) g_app.cfg.theme = nm;
-    g_app.selIdx = 0;
+    g_app.selIdx = g_app.cfg.noTheme ? -1 : 0;
     for (size_t i = 0; i < g_app.themes.size(); ++i)
         if (g_app.themes[i].name == g_app.cfg.theme) g_app.selIdx = (int)i;
     SaveConfig(g_app.cfg);
@@ -1291,9 +1373,9 @@ static void ConfirmDeleteTheme() {
     int n = (int)g_app.themes.size();
     int sel = g_app.selIdx - (d.idx < g_app.selIdx ? 1 : 0);
     if (sel > n - 1) sel = n - 1;
-    if (sel < 0) sel = 0;
+    if (sel < 0 && !g_app.cfg.noTheme) sel = 0;
     g_app.selIdx = sel;
-    g_app.cfg.theme = n == 0 ? L"" : g_app.themes[sel].name;
+    g_app.cfg.theme = n == 0 || sel < 0 ? L"" : g_app.themes[sel].name;
     SaveConfig(g_app.cfg);
     ClearThumbs();
     ComputeLayout(g_app.L);
@@ -1585,6 +1667,7 @@ static D2D1_COLOR_F GlassVeil(const Palette& p) {
 }
 
 static void EnsureGlassBitmap(bool force = false) {
+    if (!g_app.gfx.dc()) return;
     static ULONGLONG lastCheck = 0;
     ULONGLONG now = GetTickCount64();
     if (!force && now - lastCheck < 1500) return;   // 注册表最多 1.5 秒查一次
@@ -1689,6 +1772,7 @@ static D2D1::Matrix3x2F MinAnimMatrix() {
 
 static void RenderFrame() {
     Gfx& g = g_app.gfx;
+    if (!g.dc()) return;
     const Palette& p = g_app.pal;
     SyncThumbs();                            // 可能释放/新建 D2D 位图，放在 begin 之前
     if (!g.begin()) return;
@@ -1814,7 +1898,7 @@ static void TrayMenu() {
         g_app.cfg.autoSwitch = !g_app.cfg.autoSwitch;
         g_app.toggleTarget[0] = g_app.cfg.autoSwitch ? 1.0f : 0.0f;
         SaveConfig(g_app.cfg);
-        if (g_app.cfg.autoSwitch) ApplyCurrent(true);
+        if (g_app.cfg.autoSwitch) { CheckExternalWallpaper(); ApplyCurrent(true); }
         StartAnim();
         InvalidateRect(g_app.hwnd, nullptr, FALSE);
         break;
@@ -1836,7 +1920,7 @@ static void TrayMenu() {
         g_app.cfg.switchMode = cmd - 21;
         g_app.swTarget = g_app.cfg.switchMode;
         SaveConfig(g_app.cfg);
-        if (g_app.cfg.autoSwitch) ApplyCurrent(true);
+        if (g_app.cfg.autoSwitch) { CheckExternalWallpaper(); ApplyCurrent(true); }
         StartAnim();
         InvalidateRect(g_app.hwnd, nullptr, FALSE);
         break;
@@ -1888,6 +1972,7 @@ static void RemoveTrayIcon() {
 //  缩略图 / 调色板
 // ---------------------------------------------------------------------------
 static void ClearThumbs() {
+    g_thumbLoader.cancel(++g_thumbGeneration);
     for (ID2D1Bitmap* b : g_app.thumbs)
         if (b) b->Release();
     g_app.thumbs.clear();
@@ -1895,7 +1980,7 @@ static void ClearThumbs() {
 }
 
 // 只保留"视口内 + 上下各一行缓冲"的缩略图：主题多时不占内存，
-// 滚动到哪儿解到哪儿（滚动中每帧调用，只有范围变了才真的干活）。
+// 滚动到哪儿解到哪儿，解码交给后台线程，GPU 位图仍在界面线程创建。
 static void SyncThumbs() {
     Layout& L = g_app.L;
     const int n = (int)g_app.themes.size();
@@ -1925,13 +2010,20 @@ static void SyncThumbs() {
             g_app.thumbTried[i] = 0;
         }
     }
+    std::vector<ThumbRequest> requests;
+    // 可见卡片优先，缓冲行稍后解码。
+    for (int i = L.firstVis; i <= L.lastVis; ++i) {
+        if (i < 0 || i >= n) continue;
+        if (!g_app.thumbs[i] && !g_app.thumbTried[i])
+            requests.push_back({g_thumbGeneration, i, g_app.themes[i].dayImage});
+    }
     for (int i = keepA; i <= keepB; ++i) {
         if (i < 0 || i >= n) continue;
-        if (!g_app.thumbs[i] && !g_app.thumbTried[i]) {
-            g_app.thumbTried[i] = 1;
-            g_app.thumbs[i] = g_app.gfx.loadImage(g_app.themes[i].dayImage, 420);
-        }
+        if (i >= L.firstVis && i <= L.lastVis) continue;
+        if (!g_app.thumbs[i] && !g_app.thumbTried[i])
+            requests.push_back({g_thumbGeneration, i, g_app.themes[i].dayImage});
     }
+    g_thumbLoader.submit(g_app.hwnd, kThumbReadyMessage, g_thumbGeneration, std::move(requests));
 }
 
 // 外观 0=跟随系统 1=浅色 2=深色
@@ -1959,10 +2051,11 @@ static int g_paintCount = 0;        // TW_ANIMLOG 调试钩子用：WM_PAINT 次
 static double g_lastFrameEnd = 0;   // TW_ANIMLOG 调试钩子用：上一帧结束的 QPC 时间
 
 static void StartAnim() {
+    if (!g_app.gfx.dc() || !IsWindowVisible(g_app.hwnd)) return;
     // 开关/分段控件/窗口淡入淡出按实际经过时间插值，8ms 定时器足够。
     // 全屏切换动画不走这个定时器：StartZoom() 直接调用 RunZoomAnim() 一口气跑完、
     // 用 DwmFlush() 自控节奏（WM_TIMER 最小间隔 ~15.6ms 会砍到 64fps）。
-    SetTimer(g_app.hwnd, TM_ANIM, 8, nullptr);
+    if (SetTimer(g_app.hwnd, TM_ANIM, 8, nullptr)) g_animTimerPrecision.acquire();
 }
 
 // WINDOWPLACEMENT 的 rcNormalPosition 用"工作区坐标"（原点 = 所在显示器 rcWork
@@ -2062,6 +2155,8 @@ static void TrackNormRect() {
 // 直接由 StartZoom 调用，点击后 ~1ms 就开跑（定时器会让首帧迟到 15~31ms）。
 // 进度用 QPC：见 qpcMs 的说明。
 static void RunZoomAnim() {
+    AnimationTimerPrecision precision;
+    precision.acquire();
     float dur = g_app.zoomMs > 40.0f ? g_app.zoomMs : 40.0f;
     g_app.gfx.presentSync = 0;      // 节奏交给 DwmFlush，Present 自己不再等垂直同步
     // 调试钩子：环境变量 TW_ANIMLOG=1 时把每帧耗时拆解（set/paint/flush）追加写
@@ -2215,6 +2310,8 @@ static void ApplyMinRect(float p) {
 
 // 动画主循环：触发点直接跑完（QPC 计时；不等 WM_TIMER，否则首帧会迟到还跳段）
 static void RunMinAnim() {
+    AnimationTimerPrecision precision;
+    precision.acquire();
     const float durMs = g_app.minMs;
     LARGE_INTEGER f, t0;
     QueryPerformanceFrequency(&f);
@@ -2322,7 +2419,32 @@ static void StartWindowAnim(bool show) {
     StartAnim();
 }
 
+static bool EnsureUiInitialized() {
+    if (g_app.gfx.dc()) return true;
+    if (!g_app.gfx.init(g_app.hwnd)) {
+        MessageBoxW(g_app.hwnd, L"图形初始化失败（需要 DirectX 11 / Windows 10 及以上）",
+                    kAppDisplay, MB_OK | MB_ICONERROR);
+        return false;
+    }
+    RECT rc;
+    GetClientRect(g_app.hwnd, &rc);
+    float sc = g_app.gfx.scale();
+    g_app.winWDip = (rc.right - rc.left) / sc;
+    g_app.winHDip = (rc.bottom - rc.top) / sc;
+    ComputeLayout(g_app.L);
+    EnsureCardVisible(g_app.selIdx, true);
+    if (g_app.glass) EnsureGlassBitmap(true);
+    return true;
+}
+
 static void ShowMainWindow() {
+    if (!EnsureUiInitialized()) return;
+    if (!IsWindowVisible(g_app.hwnd)) {
+        g_app.toggleAnim[0] = g_app.toggleTarget[0];
+        g_app.toggleAnim[1] = g_app.toggleTarget[1];
+        g_app.segAnim = (float)g_app.segTarget;
+        g_app.swAnim = (float)g_app.swTarget;
+    }
     if (IsIconic(g_app.hwnd)) {
         StartMinAnim(false);              // 从任务栏里唤回来：反向播一遍缩放动画
         return;
@@ -2439,7 +2561,10 @@ static void StepAnim() {
         if (targetA > 0.5f && g_app.sbAlpha > 0.002f) busy = true;   // 等淡出走完再停
     }
     InvalidateRect(g_app.hwnd, nullptr, FALSE);
-    if (!busy && !g_app.winAnimating) KillTimer(g_app.hwnd, TM_ANIM);
+    if (!busy && !g_app.winAnimating) {
+        KillTimer(g_app.hwnd, TM_ANIM);
+        g_animTimerPrecision.release();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2449,6 +2574,7 @@ static void SelectTheme(int idx) {
     if (idx < 0 || idx >= (int)g_app.themes.size()) return;
     g_app.selIdx = idx;
     g_app.cfg.theme = g_app.themes[idx].name;
+    g_app.cfg.noTheme = false;
     SaveConfig(g_app.cfg);
     ComputeLayout(g_app.L);
     EnsureCardVisible(g_app.selIdx);     // 卡片在第二行以后就平滑滚过去
@@ -2724,6 +2850,22 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     }
 
+    case kThumbReadyMessage: {
+        const Layout& L = g_app.L;
+        for (auto& result : g_thumbLoader.takeResults()) {
+            int i = result.request.index;
+            if (result.request.generation != g_thumbGeneration || i < 0 ||
+                i >= (int)g_app.thumbs.size() || g_app.thumbs[i] ||
+                i < L.firstVis - L.perRow || i > L.lastVis + L.perRow) continue;
+            g_app.thumbTried[i] = 1;
+            if (!result.pixels.empty())
+                g_app.thumbs[i] = g_app.gfx.createBitmapFromPixels(
+                    result.pixels.data(), result.width, result.height);
+        }
+        if (IsWindowVisible(h)) InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+
     case WM_SIZE:
         // 最小化动画期间窗口尺寸每帧都在变小，但布局必须冻结在动画开始时的尺寸
         //（RenderFrame 里整体等比缩放）。另外最小化瞬间系统会送 WM_SIZE(SIZE_MINIMIZED)，
@@ -2772,14 +2914,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 
     case WM_SETTINGCHANGE: {
         RefreshPalette();
+        CheckExternalWallpaper();
         // 跟随系统：系统深浅色一改就立刻换壁纸（5 秒轮询只是兜底，这里更快）
-        static int lastSysStage = -1;
         if (g_app.cfg.switchMode == 1 && g_app.cfg.autoSwitch) {
-            int s = SystemUsesDarkMode() ? 1 : 0;
-            if (s != lastSysStage) {
-                lastSysStage = s;
-                ApplyCurrent(true);
-            }
+            ApplyCurrent(false);
         }
         InvalidateRect(h, nullptr, FALSE);
         return 0;
@@ -2891,16 +3029,16 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         } else if (id == CID_DAY_MINUS || id == CID_DAY_PLUS) {
             g_app.cfg.dayStart = (g_app.cfg.dayStart + (id == CID_DAY_PLUS ? 30 : -30) + 1440) % 1440;
             SaveConfig(g_app.cfg);
-            if (g_app.cfg.autoSwitch) ApplyCurrent(true);
+            if (g_app.cfg.autoSwitch) { CheckExternalWallpaper(); ApplyCurrent(true); }
         } else if (id == CID_NIGHT_MINUS || id == CID_NIGHT_PLUS) {
             g_app.cfg.nightStart = (g_app.cfg.nightStart + (id == CID_NIGHT_PLUS ? 30 : -30) + 1440) % 1440;
             SaveConfig(g_app.cfg);
-            if (g_app.cfg.autoSwitch) ApplyCurrent(true);
+            if (g_app.cfg.autoSwitch) { CheckExternalWallpaper(); ApplyCurrent(true); }
         } else if (id == CID_AUTO) {
             g_app.cfg.autoSwitch = !g_app.cfg.autoSwitch;
             g_app.toggleTarget[0] = g_app.cfg.autoSwitch ? 1.0f : 0.0f;
             SaveConfig(g_app.cfg);
-            if (g_app.cfg.autoSwitch) ApplyCurrent(true);
+            if (g_app.cfg.autoSwitch) { CheckExternalWallpaper(); ApplyCurrent(true); }
             StartAnim();
         } else if (id == CID_BOOT) {
             g_app.cfg.startOnBoot = !g_app.cfg.startOnBoot;
@@ -2929,7 +3067,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             g_app.cfg.switchMode = id - CID_SWITCH0;
             g_app.swTarget = g_app.cfg.switchMode;
             SaveConfig(g_app.cfg);
-            if (g_app.cfg.autoSwitch) ApplyCurrent(true);
+            if (g_app.cfg.autoSwitch) { CheckExternalWallpaper(); ApplyCurrent(true); }
             StartAnim();
         } else if (id == CID_OV_CANCEL) {
             CloseAddTheme();
@@ -2971,13 +3109,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         }
         if (w == TM_TICK) {
-            static int lastStage = -1;
-            int stage = TargetStage();          // 按时段 / 跟随系统统一在这里比对
-            if (g_app.cfg.autoSwitch && stage != lastStage) {
-                lastStage = stage;
-                ApplyCurrent(true);
-            }
-            InvalidateRect(h, nullptr, FALSE);
+            CheckExternalWallpaper();
+            ApplyCurrent(false);
+            if (IsWindowVisible(h) && !IsIconic(h)) InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
         break;
@@ -2990,7 +3124,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     case WM_APP + 4: {    // 来自第二个实例：--set-theme 接力——重读配置并立即切换
         g_app.cfg = LoadConfig();
         g_app.themes = ScanThemes();
-        g_app.selIdx = 0;
+        g_app.selIdx = g_app.cfg.noTheme ? -1 : 0;
         for (size_t i = 0; i < g_app.themes.size(); ++i)
             if (g_app.themes[i].name == g_app.cfg.theme) { g_app.selIdx = (int)i; break; }
         ClearThumbs();                    // 主题列表重建了：缩略图缓存全套作废
@@ -3128,7 +3262,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return 0;
 
     case WM_POWERBROADCAST:
-        if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) ApplyCurrent(true);
+        if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) {
+            CheckExternalWallpaper();
+            ApplyCurrent(true);
+        }
         return TRUE;
 
     case WM_CLOSE:
@@ -3137,6 +3274,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return 0;
 
     case WM_DESTROY:
+        g_thumbLoader.stop();              // 等解码结束，再销毁窗口关联的图形资源
+        KillTimer(h, TM_ANIM);
+        g_animTimerPrecision.release();
         RemoveTrayIcon();
         if (g_app.trayIcon) { DestroyIcon(g_app.trayIcon); g_app.trayIcon = nullptr; }
         KillTimer(h, TM_TICK);
@@ -3156,7 +3296,6 @@ int wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // DPI 感知：Per-Monitor V2（保证 200% 缩放下的清晰度）
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     SetProcessShutdownParameters(0x3FF, SHUTDOWN_NORETRY);
-    timeBeginPeriod(1);
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -3209,6 +3348,7 @@ int wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         if (!setTheme.empty()) {
             Config c = LoadConfig();
             c.theme = setTheme;
+            c.noTheme = false;
             SaveConfig(c);
             NotifyExistingInstance(WM_APP + 4);
             return 0;
@@ -3246,19 +3386,21 @@ int wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
     if (!setTheme.empty()) {
         g_app.cfg.theme = setTheme;
+        g_app.cfg.noTheme = false;
         SaveConfig(g_app.cfg);        // 命令行指定主题时立即落盘
     }
     g_app.themes = ScanThemes();
+    if (g_app.cfg.noTheme) g_app.selIdx = -1;
     if (!g_app.cfg.theme.empty()) {
         for (size_t i = 0; i < g_app.themes.size(); ++i)
             if (g_app.themes[i].name == g_app.cfg.theme) { g_app.selIdx = (int)i; break; }
     }
-    if (!g_app.themes.empty() && g_app.themes[g_app.selIdx].name != g_app.cfg.theme) {
+    if (!g_app.cfg.noTheme && !g_app.themes.empty() && g_app.themes[g_app.selIdx].name != g_app.cfg.theme) {
         // 配置里的主题已经不存在了（被删掉/改名）→ 落到第一个可用主题并写回配置
         g_app.cfg.theme = g_app.themes[g_app.selIdx].name;
         SaveConfig(g_app.cfg);
     }
-    if (!g_app.themes.empty() && g_app.cfg.theme.empty()) {
+    if (!g_app.cfg.noTheme && !g_app.themes.empty() && g_app.cfg.theme.empty()) {
         g_app.cfg.theme = g_app.themes[0].name;
         SaveConfig(g_app.cfg);
     }
@@ -3282,6 +3424,7 @@ int wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
                 g_app.statusMsgUntil = GetTickCount64() + 8000;
             } else if (ImportTheme(name, dayImg, nightImg, outName, &err)) {
                 g_app.cfg.theme = outName;
+                g_app.cfg.noTheme = false;
                 SaveConfig(g_app.cfg);
                 g_app.themes = ScanThemes();
                 for (size_t i = 0; i < g_app.themes.size(); ++i)
@@ -3346,12 +3489,6 @@ int wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     DwmSetWindowAttribute(g_app.hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
 
     RefreshPalette();
-    if (!g_app.gfx.init(g_app.hwnd)) {
-        MessageBoxW(nullptr, L"图形初始化失败（需要 DirectX 11 / Windows 10 及以上）",
-                    kAppDisplay, MB_OK | MB_ICONERROR);
-        return 2;
-    }
-    g_app.gfx.resize(w, h, dpi);
     {
         float sc = dpi / 96.0f;
         g_app.winWDip = w / sc;
@@ -3410,13 +3547,14 @@ int wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // 开机自启（--autostart）时不弹主界面，只在托盘里静默跑：壁纸该切照切；
     // 用户点托盘图标/开始菜单快捷方式（带 --show）时才出现。--show 显式压过它。
     const bool showNow = !wantHidden || wantShow;
+    if ((showNow || !addThemeUiFolder.empty()) && !EnsureUiInitialized()) return 2;
+    g_app.winAnim = showNow ? 0.0f : 1.0f;
     ShowWindow(g_app.hwnd, showNow ? SW_SHOWNORMAL : SW_HIDE);
     UpdateWindow(g_app.hwnd);
     TrackNormRect();                                  // 记下初始矩形（还原动画的落点）
     SetTimer(g_app.hwnd, TM_TICK, 5000, nullptr);     // 5 秒一次：到点切壁纸 + 重采磨砂底
 
     // 首次出现也走一遍淡入动画（后台启动就不播了）
-    g_app.winAnim = showNow ? 0.0f : 1.0f;
     if (showNow) StartWindowAnim(true);
 
     // --add-theme-ui=<文件夹>：测试/演示钩子——打开"添加主题"弹层，
@@ -3466,7 +3604,6 @@ int wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     RemoveTrayIcon();
     g_app.gfx.shutdown();
     ClearThumbs();
-    timeEndPeriod(1);
     CoUninitialize();
     return 0;
 }

@@ -81,15 +81,22 @@ static void MigrateLegacyAppData(const std::wstring& appdata, const std::wstring
 }
 
 std::wstring AppDataDir() {
-    wchar_t buf[MAX_PATH * 2] = {0};
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, buf))) return L"";
-    std::wstring d = JoinPath(buf, kAppName);
-    MigrateLegacyAppData(buf, d);
-    CreateDirectoryW(d.c_str(), nullptr);   // 不存在则创建（已存在返回错误，忽略）
-    return d;
+    static const std::wstring dir = [] {
+        wchar_t buf[MAX_PATH * 2] = {0};
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, buf)))
+            return std::wstring();
+        std::wstring d = JoinPath(buf, kAppName);
+        MigrateLegacyAppData(buf, d);
+        CreateDirectoryW(d.c_str(), nullptr);
+        return d;
+    }();
+    return dir;
 }
 
-std::wstring ConfigPath() { return JoinPath(AppDataDir(), L"config.ini"); }
+std::wstring ConfigPath() {
+    static const std::wstring path = JoinPath(AppDataDir(), L"config.ini");
+    return path;
+}
 
 // 主题搜索目录：1) 程序（安装）目录 themes\（随程序安装的主题 + 用户自加主题）
 //               2) %APPDATA%\Dynamic Wallpapers\themes\（用户目录）
@@ -140,6 +147,7 @@ static void PutStr(const wchar_t* key, const std::wstring& v) {
 Config LoadConfig() {
     Config c;
     c.theme        = GetStr(L"Theme", L"");
+    c.noTheme      = GetInt(L"NoTheme", 0) != 0;
     c.dayStart     = GetInt(L"DayStart", 6 * 60);
     c.nightStart   = GetInt(L"NightStart", 18 * 60);
     c.autoSwitch   = GetInt(L"AutoSwitch", 1) != 0;
@@ -161,6 +169,7 @@ Config LoadConfig() {
 
 void SaveConfig(const Config& c) {
     PutStr(L"Theme", c.theme);
+    PutInt(L"NoTheme", c.noTheme ? 1 : 0);
     PutInt(L"DayStart", c.dayStart);
     PutInt(L"NightStart", c.nightStart);
     PutInt(L"AutoSwitch", c.autoSwitch ? 1 : 0);
@@ -693,6 +702,28 @@ std::wstring CurrentWallpaperPath() {
 // ---------------------------------------------------------------------------
 //  壁纸（填充方式值与 IDesktopWallpaper::SetPosition 的枚举一致）
 // ---------------------------------------------------------------------------
+bool ReadWallpaperSnapshot(std::vector<std::pair<std::wstring, std::wstring>>& snapshot) {
+    IDesktopWallpaper* dw = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL,
+                                IID_IDesktopWallpaper, (void**)&dw))) return false;
+    std::vector<std::pair<std::wstring, std::wstring>> result;
+    UINT count = 0;
+    bool ok = SUCCEEDED(dw->GetMonitorDevicePathCount(&count));
+    for (UINT i = 0; ok && i < count; ++i) {
+        LPWSTR monitor = nullptr, image = nullptr;
+        HRESULT hr = dw->GetMonitorDevicePathAt(i, &monitor);
+        if (SUCCEEDED(hr)) hr = dw->GetWallpaper(monitor, &image);
+        if (SUCCEEDED(hr) && monitor) result.emplace_back(monitor, image ? image : L"");
+        else ok = false;
+        CoTaskMemFree(image);
+        CoTaskMemFree(monitor);
+    }
+    dw->Release();
+    if (!ok || result.empty()) return false;
+    snapshot = std::move(result);
+    return true;
+}
+
 bool ApplyWallpaper(const std::wstring& image, int style) {
     if (image.empty() || !FileExists(image)) return false;
 

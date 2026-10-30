@@ -43,7 +43,7 @@ echo "==> 编译主程序"
 cd "$BUILD/src"
 "$WINDRES" -I. --codepage=65001 -i app.rc -o app_res.o
 "$GXX" $CXXFLAGS -mwindows -o "$APPEXE" \
-    main.cpp gfx.cpp ui.cpp core.cpp app_res.o \
+    main.cpp gfx.cpp ui.cpp core.cpp thumbs.cpp app_res.o \
     -include windowsx.h $LIBS
 cp "$APPEXE" "$DIST/$PORTABLE"
 # 便携版：主题目录跟在 exe 旁边（dist/ 不进仓库，见 .gitignore）。

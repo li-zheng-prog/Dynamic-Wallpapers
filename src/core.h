@@ -10,6 +10,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 // 一个主题 = 一个文件夹，含 theme.json（WDD 兼容，可选）+ 若干图片
@@ -26,6 +27,7 @@ struct ThemeInfo {
 //（更名前为 %APPDATA%\TimeWall，首次运行自动迁移）
 struct Config {
     std::wstring theme;          // 选中的主题名
+    bool noTheme = false;        // 用户在 Windows 更换壁纸后保持无主题状态
     int dayStart = 6 * 60;       // 日间开始（分钟，从 0:00 起算）
     int nightStart = 18 * 60;    // 夜间开始
     bool autoSwitch = true;      // 自动切换总开关
@@ -86,6 +88,8 @@ std::wstring FormatDuration(int minutes);            // "2 小时 14 分"
 // ---- 壁纸 ----
 std::wstring CurrentWallpaperPath();                 // 当前系统壁纸文件（毛玻璃底图用）
 bool ApplyWallpaper(const std::wstring& image, int style);
+// 读取每个显示器的壁纸；空路径代表纯色背景。读取失败时返回 false。
+bool ReadWallpaperSnapshot(std::vector<std::pair<std::wstring, std::wstring>>& snapshot);
 
 // ---- 开机自启（HKCU\Software\Microsoft\Windows\CurrentVersion\Run）----
 bool AutoStartEnabled();
