@@ -4,9 +4,8 @@
 //  只在两个时间点之间切换壁纸：日间开始 ~ 夜间开始用主题的日间图，其余时间用
 //  夜间图；或跟随系统深浅色。设置改动即时保存到 %APPDATA%\Dynamic Wallpapers\config.ini。
 //
-//  窗口：无边框 + 全自绘标题栏的 WS_POPUP 窗口，Win11 圆角/阴影由 DWM 提供。
-//  最大化/最小化动画自己插值窗口矩形（系统动画对 DComp 无重定向位图的窗口不生效，
-//  见 StartZoom / StartMinAnim 的说明）。
+//  窗口：标准顶层窗口 + 自绘标题栏，Win11 圆角/阴影由 DWM 提供。
+//  最小化及从任务栏还原交给 Windows；最大化仍使用 StartZoom 的矩形过渡。
 //
 //  命令行：--show 显示窗口 / --apply 立即应用并退出 / --autostart 开机静默进托盘 /
 //          --set-theme=名字 / --add-theme=文件夹 / --delete-theme=名字 /
@@ -36,6 +35,7 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned i
 #include "core.h"
 #include "resource.h"
 #include "thumbs.h"
+#include "wallpaper_state.h"
 
 #pragma comment(lib, "shell32")
 
@@ -43,6 +43,8 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned i
 //  常量与全局状态
 // ---------------------------------------------------------------------------
 static const wchar_t* kWindowClass = L"DynamicWallpapersMainWindow";
+// 保留标准标题栏样式供 Windows 管理最小化/还原；WM_NCCALCSIZE 只移除其可见区域。
+static constexpr DWORD kMainWindowStyle = WS_OVERLAPPEDWINDOW;
 static const wchar_t* kAppDisplay = L"Dynamic Wallpapers";
 static const wchar_t* kLegacyDisplay = L"壁纸随时间变化";   // 更名前：旧快捷方式/开始菜单文件夹名
 static const float kWinW = 700.0f;      // 默认窗口宽（DIP）
@@ -53,6 +55,7 @@ static const float kCardW = 152.0f;     // 主题卡片尺寸（DIP）
 static const float kCardH = 148.0f;
 static const float kCardGapY = 16.0f;   // 卡片行与行之间的竖直间距（DIP）
 static const int   kMaxCards = 6;       // 主题卡片每行最多几张（窗口拉宽后能放更多）
+static constexpr UINT kApplySelectionMessage = WM_APP + 6;
 static const int   kThemeSlots = 48;    // 卡片网格容量上限（同时决定卡片控件 ID 区间）
 
 // 控件 ID。主题卡片 ID = 基址 + 主题下标：
@@ -75,7 +78,7 @@ enum CtrlId {
     CID_REN_CANCEL = 83, CID_REN_OK, CID_REN_NAME,
 };
 
-enum TimerId { TM_TICK = 1, TM_ANIM = 2, TM_CARET = 3 };
+enum TimerId { TM_TICK = 1, TM_ANIM = 2, TM_CARET = 3, TM_WALLPAPER = 4 };
 
 // 布局（每帧重算；绘制与命中测试共用同一套矩形）。
 // 坐标系：所有矩形都是内容坐标，窗口坐标 y = 内容坐标 y - scroll。
@@ -154,18 +157,20 @@ struct App {
     Config cfg;
     std::vector<ThemeInfo> themes;
     int selIdx = 0;
-    std::wstring appliedImage;               // 仅在应用成功后更新，失败留给定时器重试
+    std::wstring appliedImage;               // 所有显示器确认后才更新，失败进行有限重试
     int appliedStyle = -1;
     bool applyingWallpaper = false;          // 防止壁纸广播设置变更时重入
-    std::vector<std::pair<std::wstring, std::wstring>> wallpaperSnapshot;
+    bool readingWallpaper = false;
+    bool selectionQueued = false;
+    bool selectionDeferred = false;
+    WallpaperTracker wallpaper;
     Palette pal;
     bool glass = true;                      // 自绘磨砂底（--self-glass 强制时用）
     bool liveGlass = false;                 // 系统亚克力（DWM 实时模糊窗口背后，Win11 22H2+）
     bool solidBg = false;                   // 纯色底（Win10 默认 / --solid），跟随深浅色
     float winWDip = kWinW, winHDip = kWinH; // 当前客户区尺寸（DIP）——全屏/分屏后布局跟着走
     bool maximized = false;
-    // 全屏切换动画：无边框 + 自绘标题栏的 WS_POPUP 窗口拿不到系统自带的
-    // 最大化/最小化缩放动画，直接发 SC_MAXIMIZE 是"啪"地一下，所以自己插值窗口矩形。
+    // 最大化 / 从最大化还原的矩形过渡（最小化及从任务栏还原由 Windows 处理）。
     bool zooming = false;
     bool zoomToMax = false;
     RECT zoomFrom = {}, zoomTo = {};
@@ -217,14 +222,6 @@ struct App {
     bool winAnimating = false;
     bool hideAfterAnim = false;
 
-    // 最小化 / 从任务栏还原的缩放动画：按系统原生动画的实测参数复刻（见 StartMinAnim）
-    bool  minAnimating = false;             // 动画进行中（布局冻结、命中测试暂停）
-    bool  minToIcon = true;                 // true=收进任务栏，false=从任务栏展开
-    RECT  minFrom = {}, minTo = {}, minRect = {};   // 屏幕坐标：起点/终点/当前帧
-    int   minRefW = 0;                      // 冻结时的窗口物理宽度（缩放系数 = 当前宽/minRefW）
-    float minMs = 150.0f;                   // 动画时长（实测系统 ≈150ms；--min-ms= 可放慢）
-    bool  minWasMaximized = false;          // 还原方向：最小化前是不是最大化
-
     // 测试/调试
     int simulateHour = -1;
     std::wstring statusMsg;                 // 临时提示（如"已应用"）
@@ -263,7 +260,7 @@ static AnimationTimerPrecision g_animTimerPrecision;
 static void ComputeLayout(Layout& L);
 static void UpdateScrollView(Layout& L);
 static void RefreshPalette();
-static void ApplyCurrent(bool force);
+static void ApplyCurrent(bool force, bool explicitRequest = false);
 static void StartAnim();
 static void StartZoom(bool toMax);
 static void RunZoomAnim();
@@ -618,29 +615,71 @@ static const ThemeInfo* SelectedTheme() {
     return &g_app.themes[g_app.selIdx];
 }
 
-// 只比较两次快照中都存在的显示器，插拔显示器不会被当成手动换壁纸。
-static void CheckExternalWallpaper() {
-    if (g_app.applyingWallpaper || g_app.cfg.noTheme || !SelectedTheme()) return;
-    std::vector<std::pair<std::wstring, std::wstring>> current;
-    if (!ReadWallpaperSnapshot(current)) return;
-    bool changed = false;
-    for (const auto& now : current) {
-        for (const auto& before : g_app.wallpaperSnapshot) {
-            if (_wcsicmp(now.first.c_str(), before.first.c_str()) == 0 &&
-                _wcsicmp(now.second.c_str(), before.second.c_str()) != 0) changed = true;
-        }
-    }
-    g_app.wallpaperSnapshot = std::move(current);
-    if (!changed) return;
-    g_app.cfg.noTheme = true;
-    g_app.cfg.theme.clear();
-    g_app.selIdx = -1;
+// Only poll rapidly while a write or an external-change confirmation is pending.
+static void QueueDeferredSelection() {
+    if (g_app.selectionDeferred && !g_app.selectionQueued && g_app.hwnd)
+        g_app.selectionQueued = PostMessageW(g_app.hwnd, kApplySelectionMessage, 0, 0) != FALSE;
+}
+
+static void UpdateWallpaperTimer() {
+    if (!g_app.hwnd) return;
+    if (g_app.wallpaper.NeedsPoll()) SetTimer(g_app.hwnd, TM_WALLPAPER, 500, nullptr);
+    else KillTimer(g_app.hwnd, TM_WALLPAPER);
+}
+
+static void WallpaperApplyFailed() {
     g_app.appliedImage.clear();
     g_app.appliedStyle = -1;
-    g_app.statusMsg = L"检测到壁纸更换，已退出主题";
+    g_app.statusMsg = g_app.wallpaper.attempts >= WallpaperTracker::maxAttempts
+        ? L"壁纸切换失败，已停止重试；可点击立即应用重试"
+        : L"尚未确认壁纸切换，将重试";
     g_app.statusMsgUntil = GetTickCount64() + 6000;
-    SaveConfig(g_app.cfg);
-    if (g_app.glass) EnsureGlassBitmap(true);
+}
+
+static void CheckExternalWallpaper(ULONGLONG now = GetTickCount64()) {
+    if (g_app.applyingWallpaper || g_app.readingWallpaper || g_app.cfg.noTheme) return;
+    const ThemeInfo* theme = SelectedTheme();
+    if (!theme) return;
+    const std::wstring day = theme->dayImage, night = theme->nightImage;
+    const ULONGLONG generation = g_app.wallpaper.generation;
+    WallpaperSnapshot current;
+    g_app.readingWallpaper = true;
+    bool read = ReadWallpaperSnapshot(current);
+    g_app.readingWallpaper = false;
+    QueueDeferredSelection();
+    if (generation != g_app.wallpaper.generation || g_app.cfg.noTheme) return;
+    if (!read) {
+        g_app.wallpaper.ReadFailed();
+        if (g_app.wallpaper.pending && now - g_app.wallpaper.started >= WallpaperTracker::settleMs) {
+            g_app.wallpaper.pending = false;
+            WallpaperApplyFailed();
+        }
+        UpdateWallpaperTimer();
+        return;
+    }
+    auto result = g_app.wallpaper.Observe(current, day, night, now);
+    if (result == WallpaperTracker::Result::Confirmed) {
+        g_app.appliedImage = g_app.wallpaper.target;
+        g_app.appliedStyle = g_app.wallpaper.style;
+        g_app.statusMsg = SameWallpaperPath(g_app.appliedImage, day)
+            ? L"已应用浅色壁纸" : L"已应用深色壁纸";
+        g_app.statusMsgUntil = GetTickCount64() + 4000;
+        if (g_app.glass) EnsureGlassBitmap(true);
+    } else if (result == WallpaperTracker::Result::TimedOut) {
+        WallpaperApplyFailed();
+    } else if (result == WallpaperTracker::Result::External) {
+        g_app.cfg.noTheme = true;
+        g_app.cfg.theme.clear();
+        g_app.selIdx = -1;
+        g_app.appliedImage.clear();
+        g_app.appliedStyle = -1;
+        g_app.wallpaper.ResetSelection();
+        g_app.statusMsg = L"检测到主题外壁纸，已退出主题";
+        g_app.statusMsgUntil = GetTickCount64() + 6000;
+        SaveConfig(g_app.cfg);
+        if (g_app.glass) EnsureGlassBitmap(true);
+    }
+    UpdateWallpaperTimer();
     InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
@@ -651,33 +690,56 @@ static int TargetStage() {
     return StageAt(g_app.cfg, CurrentMinutes());
 }
 
-static void ApplyCurrent(bool force) {
-    if (g_app.applyingWallpaper) return;
-    const ThemeInfo* t = SelectedTheme();
-    if (!t) return;
-    int stage = TargetStage();
-    const std::wstring img = (stage == 0) ? t->dayImage : t->nightImage;
-    const int style = g_app.cfg.wallpaperStyle;
-    if (!force && !g_app.cfg.autoSwitch) return;
-    if (!force && img == g_app.appliedImage &&
-        style == g_app.appliedStyle) return;
-    if (g_app.wallpaperSnapshot.empty()) ReadWallpaperSnapshot(g_app.wallpaperSnapshot);
-    g_app.applyingWallpaper = true;
-    bool ok = ApplyWallpaper(img, style);
-    g_app.applyingWallpaper = false;
-    if (ok) {
-        std::vector<std::pair<std::wstring, std::wstring>> snapshot;
-        if (ReadWallpaperSnapshot(snapshot)) g_app.wallpaperSnapshot = std::move(snapshot);
-        else g_app.wallpaperSnapshot.clear();
-        g_app.appliedImage = img;
-        g_app.appliedStyle = style;
-        g_app.statusMsg = std::wstring(L"已应用") + (stage == 0 ? L"浅色" : L"深色") + L"壁纸";
-        g_app.statusMsgUntil = GetTickCount64() + 4000;
-        if (g_app.glass) EnsureGlassBitmap(true);    // 换壁纸后立刻重采磨砂底
-    } else {
+static void ApplyCurrent(bool force, bool explicitRequest) {
+    if (explicitRequest) {
+        g_app.wallpaper.ResetSelection();
         g_app.appliedImage.clear();
         g_app.appliedStyle = -1;
     }
+    if (g_app.applyingWallpaper || g_app.readingWallpaper) {
+        g_app.selectionDeferred = g_app.selectionDeferred || explicitRequest;
+        return;
+    }
+    if (!SelectedTheme()) return;
+    // Every write passes through the same external-change check, including
+    // resume, settings changes and retries. Explicit user selection starts anew.
+    const ULONGLONG checkedGeneration = g_app.wallpaper.generation;
+    CheckExternalWallpaper();
+    if (checkedGeneration != g_app.wallpaper.generation) return;
+    const ThemeInfo* t = SelectedTheme();
+    if (!t || (g_app.wallpaper.Blocked() && !explicitRequest)) return;
+    int stage = TargetStage();
+    const std::wstring img = stage == 0 ? t->dayImage : t->nightImage;
+    const int style = g_app.cfg.wallpaperStyle;
+    if (!force && !g_app.cfg.autoSwitch) return;
+    // A confirmed cache is valid only while the existing monitors still show
+    // it. Known day/night changes must continue to follow the selected mode.
+    bool matches = true;
+    for (const auto& item : g_app.wallpaper.observed) {
+        if ((SameWallpaperPath(item.second, t->dayImage) || SameWallpaperPath(item.second, t->nightImage)) &&
+            !SameWallpaperPath(item.second, img)) matches = false;
+    }
+    if (!force && matches && SameWallpaperPath(img, g_app.appliedImage) &&
+        style == g_app.appliedStyle) return;
+    if (!explicitRequest && !g_app.wallpaper.CanRequest(img, style)) return;
+    const ULONGLONG generation = g_app.wallpaper.Begin(img, style, GetTickCount64());
+    g_app.appliedImage.clear();
+    g_app.appliedStyle = -1;
+    g_app.applyingWallpaper = true;
+    bool ok = ApplyWallpaper(img, style);
+    g_app.applyingWallpaper = false;
+    QueueDeferredSelection();
+    // Synchronous Windows broadcasts may run nested UI commands.
+    if (generation != g_app.wallpaper.generation) return;
+    g_app.wallpaper.Applied(ok);
+    if (ok) {
+        g_app.statusMsg = L"正在确认壁纸切换";
+        g_app.statusMsgUntil = GetTickCount64() + 4000;
+        CheckExternalWallpaper();
+    } else {
+        WallpaperApplyFailed();
+    }
+    UpdateWallpaperTimer();
     InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
@@ -1265,7 +1327,7 @@ static void ConfirmAddTheme() {
     ClearThumbs();
     ComputeLayout(g_app.L);
     EnsureCardVisible(g_app.selIdx);     // 新主题若排在第二行之后，滚过去让它露出来
-    ApplyCurrent(true);
+    ApplyCurrent(true, true);
     g_app.statusMsg = L"已添加主题：" + outName;
     g_app.statusMsgUntil = GetTickCount64() + 6000;
     CloseAddTheme();
@@ -1327,7 +1389,7 @@ static void ConfirmRenameTheme() {
     ClearThumbs();
     ComputeLayout(g_app.L);
     EnsureCardVisible(g_app.selIdx);
-    ApplyCurrent(true);
+    ApplyCurrent(true, true);
     g_app.statusMsg = L"已重命名主题：" + oldName + L" → " + nm;
     g_app.statusMsgUntil = GetTickCount64() + 6000;
     CloseRenameTheme();
@@ -1379,7 +1441,7 @@ static void ConfirmDeleteTheme() {
     SaveConfig(g_app.cfg);
     ClearThumbs();
     ComputeLayout(g_app.L);
-    if (wasSelected) ApplyCurrent(true);     // 删的正是当前主题：立刻切到下一个
+    if (wasSelected) ApplyCurrent(true, true);     // 删的正是当前主题：立刻切到下一个
 
     g_app.statusMsg = L"已删除主题：" + t.name + L"（可在回收站里找回）";
     g_app.statusMsgUntil = GetTickCount64() + 6000;
@@ -1758,18 +1820,6 @@ static void DrawScrollbar(Gfx& g, const Palette& p) {
     g.fillRound(D2D1::RoundedRect(th, 3.0f, 3.0f), c);
 }
 
-// 最小化动画的整帧缩放矩阵：窗口矩形每帧在缩，但布局冻结在动画开始时的尺寸
-//（WM_SIZE 被忽略）→ 绘制时把整帧等比缩到"当前窗口宽 / 冻结宽"，和系统动画
-// "把窗口图整体缩下去"的观感一致。不在动画里时 = 单位矩阵。
-static D2D1::Matrix3x2F MinAnimMatrix() {
-    if (!g_app.minAnimating || g_app.minRefW <= 0) return D2D1::Matrix3x2F::Identity();
-    RECT wr;
-    if (!GetWindowRect(g_app.hwnd, &wr)) return D2D1::Matrix3x2F::Identity();
-    float k = (float)(wr.right - wr.left) / (float)g_app.minRefW;
-    if (k <= 0.0f || k > 1.0f) k = 1.0f;
-    return D2D1::Matrix3x2F::Scale(k, k);
-}
-
 static void RenderFrame() {
     Gfx& g = g_app.gfx;
     if (!g.dc()) return;
@@ -1830,8 +1880,7 @@ static void RenderFrame() {
     g.dc()->PushAxisAlignedClip(
         D2D1::RectF(0, Ui::TitleBarH, g_app.winWDip, g_app.winHDip),
         D2D1_ANTIALIAS_MODE_ALIASED);
-    g.dc()->SetTransform(MinAnimMatrix() *
-                         D2D1::Matrix3x2F::Translation(0, baseTy - g_app.scroll));
+    g.dc()->SetTransform(D2D1::Matrix3x2F::Translation(0, baseTy - g_app.scroll));
 
     DrawThemes(g, p);
     DrawSwitchSection(g, p);
@@ -1844,7 +1893,7 @@ static void RenderFrame() {
     UiButton(g, g_app.L.openThemesBtn, L"打开主题文件夹", p, false,
              g_app.hot == CID_OPENTHEMES, g_app.pressed == CID_OPENTHEMES, true, L"\uE838");
 
-    g.dc()->SetTransform(MinAnimMatrix());
+    g.dc()->SetTransform(D2D1::Matrix3x2F::Identity());
     g.dc()->PopAxisAlignedClip();
 
     DrawTitleBar(g, p);
@@ -1856,7 +1905,7 @@ static void RenderFrame() {
 
     if (useLayer) {
         g.dc()->PopLayer();
-        g.dc()->SetTransform(MinAnimMatrix());
+        g.dc()->SetTransform(D2D1::Matrix3x2F::Identity());
     }
     g.end();
 }
@@ -1893,7 +1942,7 @@ static void TrayMenu() {
     case 1:
         ShowMainWindow();
         break;
-    case 2: ApplyCurrent(true); break;
+    case 2: ApplyCurrent(true, true); break;
     case 3:
         g_app.cfg.autoSwitch = !g_app.cfg.autoSwitch;
         g_app.toggleTarget[0] = g_app.cfg.autoSwitch ? 1.0f : 0.0f;
@@ -2141,7 +2190,7 @@ static void ApplyZoomState(bool toMax) {
 // 记住"普通状态"下的窗口矩形（还原动画用）。缩放动画进行中、最大化、最小化时
 // 不记，否则会把动画中间帧或满屏矩形当成还原目标。
 static void TrackNormRect() {
-    if (g_app.zooming || g_app.maximized || g_app.minAnimating) return;
+    if (g_app.zooming || g_app.maximized) return;
     if (IsZoomed(g_app.hwnd) || IsIconic(g_app.hwnd)) return;
     RECT r;
     if (GetWindowRect(g_app.hwnd, &r) && r.right > r.left && r.bottom > r.top)
@@ -2251,165 +2300,6 @@ static void StartZoom(bool toMax) {
     RunZoomAnim();                     // 立即开跑：不等 WM_TIMER
 }
 
-// ---------------------------------------------------------------------------
-//  最小化 / 从任务栏还原的缩放动画（按系统原生动画的实测参数复刻）
-//
-//  系统动画对本窗口不生效：DWM 的"收进任务栏"缩放动画只对普通表面窗口播，
-//  本窗口为毛玻璃带 WS_EX_NOREDIRECTIONBITMAP（创建期样式，运行期摘不掉），
-//  实测各种组合都触发不了系统动画。按 120fps 录屏量出的参数复刻：
-//    · 时长 ≈150ms；缓动 = ease-in（进度 ≈ t²，像被"吸"进任务栏）；还原方向反向
-//    · 画面整体等比缩小，终点 ≈ 原窗口的 8%，落在本窗口任务栏按钮中心
-//    · 不淡出（系统动画过程中对比度不变）
-// ---------------------------------------------------------------------------
-static POINT TaskbarButtonCenterPoint() {
-    POINT pt = { GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) - 2 };
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (tray) {
-        RECT r; GetWindowRect(tray, &r);
-        pt.x = (r.left + r.right) / 2;
-        pt.y = r.top + (r.bottom - r.top) / 2;
-    }
-    return pt;
-}
-
-// 收进任务栏时的终态矩形：缩到 ~8%，中心压在任务栏按钮上
-static RECT CollapsedMinRect(const RECT& from) {
-    int w = from.right - from.left, h = from.bottom - from.top;
-    int nw = w * 8 / 100, nh = h * 8 / 100;
-    if (nw < 10) nw = 10;
-    if (nh < 10) nh = 10;
-    POINT c = TaskbarButtonCenterPoint();
-    RECT r = { c.x - nw / 2, c.y - nh / 2, c.x - nw / 2 + nw, c.y - nh / 2 + nh };
-    return r;
-}
-
-// rcNormalPosition 用工作区坐标（相对主屏工作区左上角），写 placement 前不换算
-// 的话窗口整体会偏移一个任务栏高度。
-static RECT ScreenToWorkspaceRect(const RECT& r) {
-    MONITORINFO mi = { sizeof(mi) };
-    RECT wa = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
-    if (GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi)) wa = mi.rcWork;
-    RECT o = { r.left - wa.left, r.top - wa.top, r.right - wa.left, r.bottom - wa.top };
-    return o;
-}
-
-// 最小化动画的一帧：按当前进度 p 摆好窗口矩形并立刻重画
-static void ApplyMinRect(float p) {
-    const RECT& a = g_app.minFrom;
-    const RECT& b = g_app.minTo;
-    g_app.minRect.left   = (LONG)lroundf(a.left   + (b.left   - a.left)   * p);
-    g_app.minRect.top    = (LONG)lroundf(a.top    + (b.top    - a.top)    * p);
-    g_app.minRect.right  = (LONG)lroundf(a.right  + (b.right  - a.right)  * p);
-    g_app.minRect.bottom = (LONG)lroundf(a.bottom + (b.bottom - a.bottom) * p);
-    SetWindowPos(g_app.hwnd, nullptr, g_app.minRect.left, g_app.minRect.top,
-                 g_app.minRect.right - g_app.minRect.left, g_app.minRect.bottom - g_app.minRect.top,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-    UpdateWindow(g_app.hwnd);     // 立刻画出来（别等 WM_PAINT 排队）
-    DwmFlush();                   // 等下一次合成，帧率跟着刷新走
-}
-
-// 动画主循环：触发点直接跑完（QPC 计时；不等 WM_TIMER，否则首帧会迟到还跳段）
-static void RunMinAnim() {
-    AnimationTimerPrecision precision;
-    precision.acquire();
-    const float durMs = g_app.minMs;
-    LARGE_INTEGER f, t0;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&t0);
-    for (;;) {
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        float t = (float)(double(now.QuadPart - t0.QuadPart) / (double(f.QuadPart) * durMs / 1000.0));
-        if (t > 1.0f) t = 1.0f;
-        // 收进任务栏 = ease-in；从任务栏展开 = 同曲线反向（先快后慢）
-        float p = g_app.minToIcon ? (t * t) : (1.0f - (1.0f - t) * (1.0f - t));
-        ApplyMinRect(p);
-        if (t >= 1.0f) break;
-    }
-    g_app.minAnimating = false;
-    if (g_app.minToIcon) {
-        // 动画把窗口挪到了任务栏小矩形上，系统会把"还原矩形"记成它——要改回真实
-        // 矩形。先 SW_MINIMIZE 再写记录，顺序不能反：收尾那一刻窗口还是普通态，
-        // rcNormalPosition 就是活位置，先写会让系统真的把窗口搬回完整矩形（闪一帧）；
-        // 最小化后窗口不可见，rcNormalPosition 只是记录，此时补写才是纯数据修改。
-        ShowWindow(g_app.hwnd, SW_MINIMIZE);
-        WINDOWPLACEMENT wp = { sizeof(wp) };
-        if (GetWindowPlacement(g_app.hwnd, &wp)) {
-            wp.rcNormalPosition = ScreenToWorkspaceRect(g_app.normRect);
-            SetWindowPlacement(g_app.hwnd, &wp);
-        }
-    } else {
-        SetForegroundWindow(g_app.hwnd);
-        InvalidateRect(g_app.hwnd, nullptr, FALSE);
-        if (g_app.minWasMaximized) {
-            ShowWindow(g_app.hwnd, SW_MAXIMIZE);   // 最小化前是最大化 → 补回状态
-            // 补写还原矩形：展开动画前 SetWindowPlacement 把 rcNormalPosition 写成
-            // 了任务栏小矩形，而 SW_MAXIMIZE 又会把当前矩形记成还原位置。此刻窗口
-            // 已是最大化态，rcNormalPosition 只是记录，补写是纯数据修改。
-            WINDOWPLACEMENT wp = { sizeof(wp) };
-            if (GetWindowPlacement(g_app.hwnd, &wp)) {
-                wp.showCmd = SW_SHOWMAXIMIZED;                 // = 当前状态 → 纯数据修改
-                if (g_app.normRect.right > g_app.normRect.left)
-                    wp.rcNormalPosition = ScreenToWorkspaceRect(g_app.normRect);
-                SetWindowPlacement(g_app.hwnd, &wp);
-            }
-        }
-    }
-    g_app.minWasMaximized = false;
-}
-
-// 入口：minimize=true 收进任务栏；false 从任务栏展开回 normRect
-static void StartMinAnim(bool minimize) {
-    HWND h = g_app.hwnd;
-    if (g_app.minAnimating || g_app.zooming) return;
-    if (minimize && IsIconic(h)) return;
-    if (!minimize && !IsIconic(h)) { ShowMainWindow(); return; }
-
-    if (minimize) {
-        RECT cur; GetWindowRect(h, &cur);
-        g_app.minRefW = cur.right - cur.left;
-        g_app.minFrom = cur;
-        g_app.minToIcon = true;
-        g_app.minTo = CollapsedMinRect(cur);
-        g_app.minAnimating = true;      // 先置位：动画每帧改矩形，TrackNormRect 必须让开
-        RunMinAnim();                   // 先把"收进去"演完，最后才真正 SW_MINIMIZE
-    } else {
-        // 从任务栏展开：先把"还原矩形"改成收起时的小矩形（窗口还在任务栏里，
-        // 纯数据修改不闪），再 SW_RESTORE 让它出现在小矩形位置，然后反向演一遍。
-        // 最大化时最小化过（WPF_RESTORETOMAXIMIZED）→ 展开目标 = 工作区，
-        // 动画结束后再真正切回最大化状态。
-        WINDOWPLACEMENT wp0 = { sizeof(wp0) };
-        GetWindowPlacement(h, &wp0);
-        bool wasMaximized = (wp0.flags & WPF_RESTORETOMAXIMIZED) != 0 || wp0.showCmd == SW_SHOWMAXIMIZED;
-        RECT target = g_app.normRect;
-        if (wasMaximized) {
-            MONITORINFO mi = { sizeof(mi) };
-            if (GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) target = mi.rcWork;
-        }
-        RECT small = CollapsedMinRect(target);
-        // 先打动画标记：SetWindowPlacement/SW_RESTORE 会触发 WM_MOVE/WM_SIZE，
-        // 那时 TrackNormRect 绝不能把 normRect 改写成任务栏小矩形
-        g_app.minAnimating = true;
-        WINDOWPLACEMENT wp = { sizeof(wp) };
-        GetWindowPlacement(h, &wp);
-        wp.rcNormalPosition = ScreenToWorkspaceRect(small);
-        SetWindowPlacement(h, &wp);
-        ShowWindow(h, SW_RESTORE);
-        // normRect 只在普通态展开时才更新；最大化分支不能写——会把"最大化之前的
-        // 普通矩形"覆盖成工作区，之后取消最大化就会"还原"成满屏（实测复现过）
-        if (!wasMaximized) g_app.normRect = target;
-        g_app.minRefW = target.right - target.left;
-        g_app.minFrom = small;
-        g_app.minTo = target;
-        g_app.minWasMaximized = wasMaximized;
-        g_app.minToIcon = false;
-        SetWindowPos(h, nullptr, small.left, small.top, small.right - small.left, small.bottom - small.top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        UpdateWindow(h);
-        RunMinAnim();
-    }
-}
-
 // 窗口动画：show=true 淡入（从下方轻推入），false 淡出后自动隐藏
 static void StartWindowAnim(bool show) {
     g_app.winAnimTarget = show ? 1.0f : 0.0f;
@@ -2446,7 +2336,8 @@ static void ShowMainWindow() {
         g_app.swAnim = (float)g_app.swTarget;
     }
     if (IsIconic(g_app.hwnd)) {
-        StartMinAnim(false);              // 从任务栏里唤回来：反向播一遍缩放动画
+        SendMessageW(g_app.hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+        SetForegroundWindow(g_app.hwnd);
         return;
     }
     ShowWindow(g_app.hwnd, SW_SHOW);
@@ -2579,7 +2470,7 @@ static void SelectTheme(int idx) {
     ComputeLayout(g_app.L);
     EnsureCardVisible(g_app.selIdx);     // 卡片在第二行以后就平滑滚过去
     StartAnim();
-    ApplyCurrent(true);
+    ApplyCurrent(true, true);
     InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
@@ -2722,13 +2613,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     switch (msg) {
     case WM_NCCALCSIZE:
-        if (w) {
-            // 客户区铺满整个窗口（去掉系统标题栏）。最大化时不要再让出边框：
-            // 那 13px 会被 DWM 用亚克力材质刷一遍，露在窗口顶部/底部就是两条
-            // "灰边"。窗口外框 = 工作区（见 WM_GETMINMAXINFO），没有多余边框。
-            return 0;
-        }
-        break;
+        // 保留 WS_CAPTION 的系统行为，但在创建及后续调整时都让客户区铺满窗口，
+        // 不显示系统标题栏/边框；最大化外框 = 工作区（见 WM_GETMINMAXINFO）。
+        return 0;
 
     case WM_NCHITTEST: {
         POINT pt = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -2810,7 +2697,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 
     case WM_GETMINMAXINFO: {
         // 必须先让系统把 ptMaxSize/ptMaxPosition 填好再改，否则最大化会忽略任务栏。
-        // WS_POPUP 窗口系统默认"按整个显示器最大化"，要显式给工作区尺寸；
+        // 自绘窗口不使用系统边框余量，要显式给工作区尺寸；
         // 不加边框余量（配合 WM_NCCALCSIZE 恒返回 0）：窗口外框 = 工作区，
         // 不会在顶部/底部留下被材质刷亮的"灰边"。
         LRESULT res = DefWindowProcW(h, msg, w, l);
@@ -2829,12 +2716,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         int minH = (int)((kWinH + 8) * dpi / 96.0f);
         if (mmi->ptMinTrackSize.x < minW) mmi->ptMinTrackSize.x = minW;
         if (mmi->ptMinTrackSize.y < minH) mmi->ptMinTrackSize.y = minH;
-        // 最小化动画要把窗口缩到 8%，这里必须把最小跟踪尺寸整个放开；
-        // 写在"取 max"之后（写在前面会被原样盖回，窗口缩到一半就被夹住）
-        if (g_app.minAnimating) {
-            mmi->ptMinTrackSize.x = 1;
-            mmi->ptMinTrackSize.y = 1;
-        }
         return res;
     }
 
@@ -2867,10 +2748,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
 
     case WM_SIZE:
-        // 最小化动画期间窗口尺寸每帧都在变小，但布局必须冻结在动画开始时的尺寸
-        //（RenderFrame 里整体等比缩放）。另外最小化瞬间系统会送 WM_SIZE(SIZE_MINIMIZED)，
-        // 客户区只有图标占位尺寸，拿它重排会毁掉布局——最小化尺寸一律不参与重排。
-        if (w == SIZE_MINIMIZED || IsIconic(h) || g_app.minAnimating) return 0;
+        // 系统最小化时的图标占位尺寸不参与布局，也不用于调整图形缓冲。
+        if (w == SIZE_MINIMIZED || IsIconic(h)) return 0;
         if (g_app.gfx.dc()) {
             RECT rc;
             GetClientRect(h, &rc);
@@ -3091,7 +2970,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         } else if (id >= CID_THEME_REN0 && id < CID_THEME_REN0 + kThemeSlots) {
             OpenRenameTheme(id - CID_THEME_REN0);
         } else if (id == CID_MIN) {
-            StartMinAnim(true);          // 收进任务栏（复刻系统原生动画）
+            SendMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0);
         } else if (id == CID_CLOSE) {
             if (g_app.cfg.minimizeToTray) HideMainWindow();
             else DestroyWindow(h);
@@ -3108,7 +2987,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
-        if (w == TM_TICK) {
+        if (w == TM_TICK || w == TM_WALLPAPER) {
             CheckExternalWallpaper();
             ApplyCurrent(false);
             if (IsWindowVisible(h) && !IsIconic(h)) InvalidateRect(h, nullptr, FALSE);
@@ -3128,24 +3007,34 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         for (size_t i = 0; i < g_app.themes.size(); ++i)
             if (g_app.themes[i].name == g_app.cfg.theme) { g_app.selIdx = (int)i; break; }
         ClearThumbs();                    // 主题列表重建了：缩略图缓存全套作废
-        ApplyCurrent(true);
+        ApplyCurrent(true, true);
         if (g_app.glass) EnsureGlassBitmap(true);
         ShowMainWindow();
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
 
+    case kApplySelectionMessage: // Apply a selection made during a synchronous settings broadcast.
+        g_app.selectionQueued = false;
+        if (g_app.applyingWallpaper || g_app.readingWallpaper) return 0;
+        g_app.selectionDeferred = false;
+        ApplyCurrent(true);
+        return 0;
+
     case WM_SYSCOMMAND: {
         const UINT sc = w & 0xFFF0;
-        // 最小化：收进任务栏的缩放动画（任务栏右键菜单里的"最小化"也走这里）
-        if (sc == SC_MINIMIZE && !g_app.zooming && !IsIconic(h)) {
-            StartMinAnim(true);
-            return 0;
-        }
-        // 从任务栏还原：反向播一遍
-        if (sc == SC_RESTORE && IsIconic(h)) {
-            StartMinAnim(false);
-            return 0;
+        if (sc == SC_MINIMIZE || (sc == SC_RESTORE && IsIconic(h))) {
+            // 中断尚未结束的显示/托盘淡出，避免系统动画叠加半透明内容，或还原后又被隐藏。
+            const bool repaint = g_app.winAnim < 1.0f;
+            g_app.winAnimating = false;
+            g_app.hideAfterAnim = false;
+            g_app.winAnim = g_app.winAnimTarget = 1.0f;
+            if (repaint) {
+                InvalidateRect(h, nullptr, FALSE);
+                UpdateWindow(h);
+            }
+            // 不改窗口矩形或 WINDOWPLACEMENT，动画和还原状态都由 Windows 管理。
+            return DefWindowProcW(h, msg, w, l);
         }
         // 最大化 / 从最大化还原（任务栏右键菜单、系统菜单）走矩形过渡动画
         if (sc == SC_MAXIMIZE && !g_app.zooming) {
@@ -3155,11 +3044,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         if (sc == SC_RESTORE && !g_app.zooming && !IsIconic(h)) {
             StartZoom(false);
             return 0;
-        }
-        if (sc == SC_RESTORE) {          // 兜底：让系统还原，然后补一个淡入
-            LRESULT r = DefWindowProcW(h, msg, w, l);
-            if (g_app.winAnim < 0.999f) StartWindowAnim(true);
-            return r;
         }
         break;
     }
@@ -3261,6 +3145,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         DestroyWindow(h);
         return 0;
 
+    case WM_DISPLAYCHANGE:
+        // The tracker compares only monitors present in both snapshots.
+        CheckExternalWallpaper();
+        return 0;
+
     case WM_POWERBROADCAST:
         if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) {
             CheckExternalWallpaper();
@@ -3280,6 +3169,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         RemoveTrayIcon();
         if (g_app.trayIcon) { DestroyIcon(g_app.trayIcon); g_app.trayIcon = nullptr; }
         KillTimer(h, TM_TICK);
+        KillTimer(h, TM_WALLPAPER);
         if (g_app.uiLayer) { g_app.uiLayer->Release(); g_app.uiLayer = nullptr; }
         SetAutoStart(g_app.cfg.startOnBoot);
         SaveConfig(g_app.cfg);
@@ -3327,8 +3217,6 @@ int wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             hoverCard = _wtoi(a.substr(13).c_str());   // 测试：模拟鼠标停在第 N 张卡片上
         else if (a.rfind(L"--zoom-ms=", 0) == 0)
             g_app.zoomMs = (float)_wtoi(a.substr(10).c_str());  // 测试：全屏动画时长
-        else if (a.rfind(L"--min-ms=", 0) == 0)
-            g_app.minMs = (float)_wtoi(a.substr(9).c_str());    // 测试：最小化动画时长
         else if (a == L"--opaque") opaque = true;    // 关毛玻璃，用不透明底（排错用）
         else if (a == L"--self-glass" || a == L"--no-acrylic")
             selfGlass = true;                          // 强制自绘磨砂（不用系统材质）
@@ -3478,7 +3366,7 @@ int wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_app.hwnd = CreateWindowExW(WS_EX_APPWINDOW
                                      | WS_EX_NOREDIRECTIONBITMAP,  // 毛玻璃的关键
                                  kWindowClass, kAppDisplay,
-                                 WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
+                                 kMainWindowStyle,
                                  sx, sy, w, h, nullptr, nullptr, hInst, nullptr);
     if (!g_app.hwnd) return 1;
 

@@ -18,7 +18,9 @@
 
 static int checks = 0, applyCalls = 0;
 static bool applySucceeds = true;
+static bool deferApply = false;
 static std::function<void()> duringApply;
+static std::function<void()> duringRead;
 static std::wstring lastImage;
 static int lastStyle = -1;
 static bool snapshotAvailable = true, appDark = false;
@@ -35,17 +37,113 @@ bool TestApplyWallpaper(const std::wstring& image, int style) {
     lastImage = image;
     lastStyle = style;
     if (duringApply) duringApply();
-    if (applySucceeds) for (auto& monitor : wallpaper) monitor.second = image;
+    if (applySucceeds && !deferApply) for (auto& monitor : wallpaper) monitor.second = image;
     return applySucceeds;
 }
 void TestSaveConfig(const Config& config) { savedConfig = config; }
 void TestSetAutoStart(bool) {}
 bool TestReadWallpaperSnapshot(std::vector<std::pair<std::wstring, std::wstring>>& out) {
+    if (duringRead) duringRead();
     if (!snapshotAvailable) return false;
     out = wallpaper;
     return !out.empty();
 }
 bool TestSystemUsesDarkMode() { return appDark; }
+
+static void TestWallpaperTracker() {
+    using Result = WallpaperTracker::Result;
+    const std::wstring day = L"C:\\Themes\\day.jpg", night = L"C:\\Themes\\night.jpg";
+    Check(SameWallpaperPath(day, L"c:/Themes/sub/../DAY.jpg"), "canonical full path comparison");
+    Check(SameWallpaperPath(day, L"\\\\?\\C:\\Themes\\day.jpg"), "extended path comparison");
+    Check(!SameWallpaperPath(day, L"C:\\Other\\day.jpg"), "same filename elsewhere is external");
+    Check(!SameWallpaperPath(day, L""), "empty path is distinct from a theme image");
+    WallpaperTracker tracker;
+    WallpaperSnapshot current = {{L"a", day}, {L"b", day}};
+    auto observe = [&](ULONGLONG now) { return tracker.Observe(current, day, night, now); };
+    observe(0);
+    tracker.Begin(night, 4, 10);
+    tracker.Applied(true);
+    Check(observe(20) == Result::None && tracker.pending,
+          "successful API call with unchanged desktop remains unconfirmed");
+    current[0].second = night;
+    Check(observe(30) == Result::None && tracker.pending && !tracker.Blocked(),
+          "partial monitor completion keeps request pending");
+    current[1].second = L"";
+    Check(observe(40) == Result::None && tracker.pending && tracker.Blocked(),
+          "transient empty monitor during write is inconclusive");
+    current[1].second = night;
+    Check(observe(50) == Result::Confirmed && !tracker.pending,
+          "all monitors must confirm the requested image");
+    Check(observe(60) == Result::None && !tracker.Blocked(), "duplicate notification is harmless");
+
+    tracker.Begin(day, 4, 70); tracker.Applied(true);
+    const auto oldGeneration = tracker.generation;
+    tracker.Begin(night, 4, 80); tracker.Applied(true);
+    current[0].second = day;
+    Check(observe(90) == Result::None && tracker.generation > oldGeneration && tracker.target == night,
+          "rapid reversal cannot confirm a superseded request");
+    current[0].second = night;
+    Check(observe(100) == Result::Confirmed, "latest request eventually confirms");
+
+    tracker.Begin(day, 4, 200); tracker.Applied(true);
+    current[0].second = L"C:\\manual.jpg";
+    Check(observe(210) == Result::None && tracker.Blocked(),
+          "manual change during outstanding write immediately blocks automatic writes");
+    Check(observe(700) == Result::None, "less than one second cannot confirm external change");
+    Check(observe(1210) == Result::External, "manual change during transition is not ignored");
+    tracker.ResetSelection();
+    current = {{L"a", day}, {L"b", day}}; observe(2000);
+    current[0].second = L"C:\\manual.jpg"; observe(2010);
+    tracker.ReadFailed();
+    Check(observe(4000) == Result::None && tracker.Blocked(), "read failure restarts external confirmation");
+    current[0].second = night;
+    Check(observe(4500) == Result::None && !tracker.Blocked(), "return to theme cancels external candidate");
+    current[0].second = L"C:\\manual-a.jpg"; observe(5000);
+    current[0].second = L"C:\\manual-b.jpg";
+    Check(observe(6000) == Result::None, "changing external candidate restarts confirmation");
+    Check(observe(7000) == Result::External, "stable replacement is confirmed");
+
+    tracker.ResetSelection();
+    current = {{L"a", day}, {L"b", day}}; observe(8000);
+    current.push_back({L"c", L"C:\\other.jpg"});
+    Check(observe(8010) == Result::None && !tracker.Blocked(), "new monitor adopts its own baseline");
+    std::reverse(current.begin(), current.end());
+    current.pop_back();
+    Check(observe(8020) == Result::None && !tracker.Blocked(), "monitor reorder and removal preserve theme");
+    current[0].second = L"C:\\manual.jpg"; observe(8030);
+    current.erase(current.begin());
+    Check(observe(9500) == Result::None && !tracker.Blocked(), "removed monitor cancels its external candidate");
+
+    tracker.ResetSelection();
+    current = {{L"a", day}}; observe(10000);
+    for (unsigned attempt = 0; attempt < WallpaperTracker::maxAttempts; ++attempt) {
+        ULONGLONG now = 10100 + attempt * 6000;
+        Check(tracker.CanRequest(night, 4), "bounded retry is available");
+        tracker.Begin(night, 4, now); tracker.Applied(true);
+        Check(observe(now + WallpaperTracker::settleMs) == Result::TimedOut,
+              "unchanged desktop times out without leaving theme");
+    }
+    Check(!tracker.CanRequest(night, 4), "three unconfirmed requests stop automatic retries");
+    current[0].second = night;
+    Check(observe(30000) == Result::Confirmed, "late successful update is still recognized");
+    tracker.Begin(day, 4, 31000); tracker.Applied(true);
+    current[0].second = L"";
+    observe(31010);
+    Check(observe(36000) == Result::TimedOut && tracker.Blocked(),
+          "persistent solid color is reconsidered after transition deadline");
+    Check(observe(37000) == Result::External, "persistent solid color exits after confirmation");
+
+    tracker.ResetSelection();
+    current = {{L"a", day}}; observe(40000);
+    for (unsigned attempt = 0; attempt < WallpaperTracker::maxAttempts; ++attempt) {
+        tracker.Begin(night, 4, 40010 + attempt); tracker.Applied(false);
+    }
+    Check(!tracker.CanRequest(night, 4) && tracker.CanRequest(day, 4),
+          "API failure retry budget is per target and position");
+    tracker.ResetSelection(); observe(41000);
+    Check(tracker.CanRequest(night, 4) && !tracker.Blocked(), "explicit selection clears retry and candidate state");
+    std::puts("PASS: delayed writes, rapid reversal, stable external confirmation, topology and bounded retries");
+}
 
 static void TestWallpaperState() {
     g_app.cfg = Config{};
@@ -89,12 +187,118 @@ static void TestWallpaperState() {
         g_app.cfg.wallpaperStyle = 2;
     };
     ApplyCurrent(true);
-    Check(applyCalls == 9 && g_app.appliedImage == theme.dayImage &&
-          g_app.appliedStyle == 3, "cache records applied values across nested changes");
+    Check(applyCalls == 9 && g_app.wallpaper.target == theme.dayImage &&
+          g_app.wallpaper.style == 3, "request records applied values across nested changes");
     duringApply = {};
     ApplyCurrent(true);
     Check(applyCalls == 9, "empty theme list is safe");
     std::puts("PASS: wallpaper deduplication, retries, schedule, reentrancy");
+}
+
+static void TestDelayedWallpaper() {
+    g_app.cfg = Config{};
+    g_app.cfg.theme = L"Test";
+    g_app.cfg.switchMode = 1;
+    g_app.selIdx = 0;
+    g_app.glass = false;
+    ThemeInfo theme;
+    theme.name = L"Test"; theme.dayImage = L"day.jpg"; theme.nightImage = L"night.jpg";
+    g_app.themes = {theme};
+    wallpaper = {{L"monitor-a", L"initial.jpg"}, {L"monitor-b", L"initial.jpg"}};
+    g_app.wallpaper.ResetSelection();
+    g_app.appliedImage.clear();
+    appDark = false;
+    ApplyCurrent(true);
+    deferApply = true;
+    appDark = true;
+    SendMessageW(g_app.hwnd, WM_SETTINGCHANGE, 0, 0);
+    Check(g_app.appliedImage.empty() && g_app.wallpaper.pending,
+          "API success does not populate cache before desktop confirmation");
+    wallpaper[0].second = theme.nightImage;
+    CheckExternalWallpaper();
+    Check(!g_app.cfg.noTheme, "delayed first monitor does not deselect theme");
+    wallpaper[1].second = theme.nightImage;
+    SendMessageW(g_app.hwnd, WM_SETTINGCHANGE, SPI_SETDESKWALLPAPER, 0);
+    Check(!g_app.cfg.noTheme, "delayed wallpaper broadcast preserves theme");
+    deferApply = false;
+    appDark = false;
+    SendMessageW(g_app.hwnd, WM_SETTINGCHANGE, 0, 0);
+    Check(!g_app.cfg.noTheme && lastImage == theme.dayImage,
+          "following system still works after delayed completion");
+    g_app.cfg.autoSwitch = false;
+    wallpaper[0].second = theme.nightImage;
+    SendMessageW(g_app.hwnd, WM_TIMER, TM_TICK, 0);
+    Check(!g_app.cfg.noTheme && wallpaper[0].second == theme.nightImage,
+          "paused theme accepts its other image without automatic writing");
+    g_app.cfg.autoSwitch = true;
+    SendMessageW(g_app.hwnd, WM_TIMER, TM_TICK, 0);
+    Check(!g_app.cfg.noTheme && wallpaper[0].second == theme.dayImage,
+          "resuming follows target even when previously applied cache matches");
+    // A real external change during the next delayed write must block every
+    // automatic entry point, including forced resume and mode changes.
+    deferApply = true;
+    appDark = true;
+    SendMessageW(g_app.hwnd, WM_SETTINGCHANGE, 0, 0);
+    wallpaper[0].second = L"manual-during-transition.jpg";
+    int calls = applyCalls;
+    SendMessageW(g_app.hwnd, WM_SETTINGCHANGE, 0, 0);
+    SendMessageW(g_app.hwnd, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
+    ApplyCurrent(true);
+    Check(applyCalls == calls && !g_app.cfg.noTheme,
+          "external candidate blocks automatic writes and forced resume");
+    CheckExternalWallpaper(GetTickCount64() + WallpaperTracker::confirmMs);
+    Check(g_app.cfg.noTheme && savedConfig.noTheme && applyCalls == calls,
+          "external wallpaper during write is preserved and persisted");
+    deferApply = false;
+    SelectTheme(0);
+    Check(!g_app.cfg.noTheme && !g_app.wallpaper.Blocked() && g_app.appliedImage == theme.nightImage,
+          "explicit selection clears pending external state");
+    appDark = false;
+    std::puts("PASS: delayed system following, pause/resume and manual changes during writes");
+}
+
+static void TestNestedThemeSelection() {
+    g_app.cfg = Config{};
+    g_app.cfg.theme = L"Old";
+    g_app.selIdx = 0;
+    g_app.simulateHour = 12;
+    g_app.glass = false;
+    ThemeInfo oldTheme, newTheme;
+    oldTheme.name = L"Old"; oldTheme.dayImage = L"old-day.jpg"; oldTheme.nightImage = L"old-night.jpg";
+    newTheme.name = L"New"; newTheme.dayImage = L"new-day.jpg"; newTheme.nightImage = L"new-night.jpg";
+    g_app.themes = {oldTheme, newTheme};
+    wallpaper = {{L"a", L"initial.jpg"}};
+    int calls = applyCalls;
+    duringApply = [] { SelectTheme(0); SelectTheme(1); };
+    ApplyCurrent(true, true);
+    duringApply = {};
+    Check(g_app.cfg.theme == newTheme.name && g_app.appliedImage.empty() && applyCalls == calls + 1,
+          "nested selection cancels old request without committing its cache");
+    MSG msg;
+    while (PeekMessageW(&msg, g_app.hwnd, kApplySelectionMessage, kApplySelectionMessage, PM_REMOVE))
+        DispatchMessageW(&msg);
+    Check(!g_app.cfg.noTheme && g_app.appliedImage == newTheme.dayImage && applyCalls == calls + 2,
+          "nested selections coalesce and apply only the latest theme");
+    g_app.cfg.autoSwitch = false;
+    wallpaper[0].second = oldTheme.nightImage;
+    CheckExternalWallpaper();
+    CheckExternalWallpaper(GetTickCount64() + WallpaperTracker::confirmMs);
+    Check(g_app.cfg.noTheme, "old theme folder is not a blanket whitelist");
+    SelectTheme(0);
+    duringRead = [] {
+        SendMessageW(g_app.hwnd, WM_SETTINGCHANGE, 0, 0);
+        g_app.themes = {g_app.themes[1]};
+        SelectTheme(0);
+    };
+    CheckExternalWallpaper();
+    duringRead = {};
+    Check(g_app.cfg.theme == newTheme.name && g_app.appliedImage.empty(),
+          "selection during snapshot read invalidates the previous result");
+    while (PeekMessageW(&msg, g_app.hwnd, kApplySelectionMessage, kApplySelectionMessage, PM_REMOVE))
+        DispatchMessageW(&msg);
+    Check(g_app.appliedImage == newTheme.dayImage && !g_app.selectionDeferred && !g_app.selectionQueued,
+          "snapshot reentrancy defers and applies latest selection safely");
+    std::puts("PASS: nested selection generation and deferred latest-theme apply");
 }
 
 static void TestExternalWallpaper() {
@@ -106,7 +310,7 @@ static void TestExternalWallpaper() {
     theme.name = L"Test"; theme.dayImage = L"day.jpg"; theme.nightImage = L"night.jpg";
     g_app.themes = {theme};
     wallpaper = {{L"monitor-a", L"initial.jpg"}, {L"monitor-b", L"initial.jpg"}};
-    g_app.wallpaperSnapshot.clear();
+    g_app.wallpaper.ResetSelection();
     g_app.appliedImage.clear();
     g_app.glass = false;
     ApplyCurrent(true);
@@ -123,6 +327,9 @@ static void TestExternalWallpaper() {
     snapshotAvailable = true;
     g_app.cfg.autoSwitch = false;
     SendMessageW(g_app.hwnd, WM_TIMER, TM_TICK, 0);
+    Check(!g_app.cfg.noTheme && applyCalls == calls,
+          "external change waits for confirmation without overwriting wallpaper");
+    CheckExternalWallpaper(GetTickCount64() + WallpaperTracker::confirmMs);
     Check(g_app.cfg.noTheme && g_app.selIdx == -1 && savedConfig.noTheme &&
           savedConfig.theme.empty(), "manual change while paused persists no-theme state");
     g_app.cfg = savedConfig;
@@ -138,6 +345,8 @@ static void TestExternalWallpaper() {
     calls = applyCalls;
     wallpaper[0].second = L"";
     CheckExternalWallpaper();
+    Check(!g_app.cfg.noTheme, "solid color waits for confirmation");
+    CheckExternalWallpaper(GetTickCount64() + WallpaperTracker::confirmMs);
     Check(g_app.cfg.noTheme && applyCalls == calls, "solid color background exits theme");
     std::puts("PASS: manual wallpaper changes, monitors, failure, persistence and re-selection");
 }
@@ -217,6 +426,81 @@ static void TestLazyGraphicsAndDpi() {
     }
     Check(g_timerPrecisionUsers == 0, "idle releases timer precision");
     std::puts("PASS: lazy graphics, real GPU buffer reuse on DPI change, timer lifetime");
+}
+
+static void TestNativeMinimize() {
+    HWND h = g_app.hwnd;
+    const LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE);
+    Check((style & WS_OVERLAPPEDWINDOW) == WS_OVERLAPPEDWINDOW && !(style & WS_POPUP),
+          "main window retains standard caption and system controls");
+    RECT outer, client;
+    GetWindowRect(h, &outer); GetClientRect(h, &client);
+    Check(outer.right - outer.left == client.right && outer.bottom - outer.top == client.bottom,
+          "standard window style keeps the custom full-client frame");
+    ShowWindow(h, SW_SHOWNOACTIVATE);
+    TrackNormRect();
+    WINDOWPLACEMENT normal = {sizeof(normal)};
+    GetWindowPlacement(h, &normal);
+    const RECT normRect = g_app.normRect;
+    const float width = g_app.winWDip, height = g_app.winHDip;
+
+    // Click the actual custom caption button while the startup fade is unfinished.
+    g_app.winAnim = 0.35f;
+    g_app.winAnimating = true;
+    const auto& button = g_app.L.captionMin;
+    LPARAM point = MAKELPARAM((int)((button.left + button.right) * 0.5f * g_app.gfx.scale()),
+                             (int)((button.top + button.bottom) * 0.5f * g_app.gfx.scale()));
+    SendMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, point);
+    SendMessageW(h, WM_LBUTTONUP, 0, point);
+    Check(IsIconic(h), "custom caption button minimizes through Windows");
+    Check(g_app.winWDip == width && g_app.winHDip == height,
+          "minimizing does not resize the content layout to icon dimensions");
+    Check(!g_app.winAnimating && !g_app.hideAfterAnim && g_app.winAnim == 1.0f,
+          "minimizing cancels the unfinished fade");
+    WINDOWPLACEMENT minimized = {sizeof(minimized)};
+    GetWindowPlacement(h, &minimized);
+    Check(EqualRect(&normal.rcNormalPosition, &minimized.rcNormalPosition),
+          "minimizing preserves the system restore rectangle");
+    Check(EqualRect(&normRect, &g_app.normRect), "minimizing preserves the maximize restore rectangle");
+    ShowMainWindow();
+    GetWindowRect(h, &outer);
+    Check(!IsIconic(h) && !IsZoomed(h) && IsWindowVisible(h) && EqualRect(&outer, &normRect),
+          "tray or second-instance show restores the normal position");
+    Check(!g_app.winAnimating && g_app.winAnim == 1.0f,
+          "restoring from the taskbar adds no application fade");
+
+    // A pending tray hide must not run after a native minimize / restore cycle.
+    StartWindowAnim(false);
+    SendMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE | 1, 0);
+    SendMessageW(h, WM_SYSCOMMAND, SC_RESTORE | 1, 0);
+    StepAnim();
+    Check(!IsIconic(h) && IsWindowVisible(h) && !g_app.hideAfterAnim,
+          "system menu minimize/restore cancels a pending tray hide");
+
+    const float zoomMs = g_app.zoomMs;
+    g_app.zoomMs = 40.0f;
+    StartZoom(true);
+    Check(IsZoomed(h), "existing maximize transition still reaches maximized state");
+    SendMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+    GetWindowPlacement(h, &minimized);
+    Check(IsIconic(h) && (minimized.flags & WPF_RESTORETOMAXIMIZED),
+          "Windows remembers minimize from maximized state");
+    Check(EqualRect(&normal.rcNormalPosition, &minimized.rcNormalPosition),
+          "maximized minimize preserves the original normal placement");
+    SendMessageW(h, WM_SYSCOMMAND, SC_RESTORE, 0);
+    Check(IsZoomed(h) && g_app.maximized && !IsIconic(h),
+          "system restore returns a minimized maximized window to maximized state");
+    SendMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+    ShowMainWindow();
+    Check(IsZoomed(h) && !IsIconic(h) && !g_app.winAnimating,
+          "tray restore also preserves maximized state without a custom fade");
+    StartZoom(false);
+    GetWindowRect(h, &outer);
+    Check(!IsZoomed(h) && EqualRect(&outer, &normRect),
+          "restore from maximized still returns to the original position");
+    g_app.zoomMs = zoomMs;
+    ShowWindow(h, SW_HIDE);
+    std::puts("PASS: native minimize/restore, placement, maximized state, fade interruption");
 }
 
 static std::wstring MakeBitmap(const wchar_t* name, LONG width, LONG height) {
@@ -310,13 +594,17 @@ int wmain() {
     wc.lpszClassName = L"DynamicWallpapersIsolatedTests";
     Check(RegisterClassW(&wc) != 0, "register isolated window class");
     g_app.hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, wc.lpszClassName,
-        L"Dynamic Wallpapers isolated tests", WS_POPUP, 0, 0, 700, 764,
+        L"Dynamic Wallpapers isolated tests", kMainWindowStyle, 0, 0, 700, 764,
         nullptr, nullptr, wc.hInstance, nullptr);
     Check(g_app.hwnd != nullptr, "create hidden isolated test window");
     TestWallpaperState();
+    TestWallpaperTracker();
+    TestDelayedWallpaper();
     TestExternalWallpaper();
+    TestNestedThemeSelection();
     TestFollowAppMode();
     TestLazyGraphicsAndDpi();
+    TestNativeMinimize();
     TestThumbnails();
     DestroyWindow(g_app.hwnd);
     g_app.gfx.shutdown();
